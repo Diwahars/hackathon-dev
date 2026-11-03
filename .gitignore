@@ -1,0 +1,17 @@
+.env
+.venv/
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.vscode/
+.idea/
+*.swp
+*.swo
+*.joblib
+
+*.log
+modules/1_embeddings/embeddings_similarity_analysis.png
+test.py
