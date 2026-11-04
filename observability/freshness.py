@@ -1,23 +1,57 @@
 import json
 import re
-
 from datetime import datetime, timezone
 
 from bifrost_client import chat
 from tavily_client import search_web
 from observability import Trace
 
+
 STALE_THRESHOLD = 0.70
 
 
-def classify_freshness(query: str):
+def _parse_json(content: str) -> dict:
+    """
+    Parse JSON returned by the LLM.
+    Handles plain JSON and JSON wrapped in Markdown fences.
+    """
+    if not content:
+        raise ValueError("LLM returned an empty response.")
+
+    content = content.strip()
+
+    # Remove Markdown JSON fences if present.
+    content = re.sub(
+        r"^```(?:json)?\s*|\s*```$",
+        "",
+        content,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        # Attempt to extract the first JSON object.
+        match = re.search(r"\{.*\}", content, re.DOTALL)
+
+        if not match:
+            raise ValueError(
+                f"Could not parse JSON from LLM response: {content}"
+            )
+
+        return json.loads(match.group(0))
+
+
+def classify_freshness(query: str) -> dict:
+    """
+    Classify whether a query depends on current information.
+    """
     response = chat(
         messages=[
             {
                 "role": "system",
                 "content": """
-Classify whether a user question requires
-current information.
+Classify whether a user question requires current information.
 
 Return JSON only:
 {
@@ -26,9 +60,12 @@ Return JSON only:
   "search_query": "web search query"
 }
 
-Mark true for current prices, recent events,
-latest versions, current policies, or changing facts.
+Mark true for current prices, recent events, latest versions,
+current policies, or changing facts.
+
 Mark false for timeless concepts and stable facts.
+
+Do not wrap the JSON in Markdown fences.
 """,
             },
             {
@@ -40,11 +77,21 @@ Mark false for timeless concepts and stable facts.
     )
 
     content = response.choices[0].message.content
+    result = _parse_json(content)
 
-    return json.loads(content)
+    return {
+        "time_sensitive": bool(
+            result.get("time_sensitive", False)
+        ),
+        "reason": str(result.get("reason", "")),
+        "search_query": str(result.get("search_query", query)),
+    }
 
 
-def extract_claims(answer: str):
+def extract_claims(answer: str) -> dict:
+    """
+    Extract factual claims from the answer that may become outdated.
+    """
     response = chat(
         messages=[
             {
@@ -62,9 +109,11 @@ Return JSON only:
   ]
 }
 
-Extract claims about dates, releases, prices,
-policies, availability, and changing information.
+Extract claims about dates, releases, prices, policies,
+availability, and changing information.
+
 Do not extract opinions or timeless facts.
+Do not wrap the JSON in Markdown fences.
 """,
             },
             {
@@ -75,12 +124,23 @@ Do not extract opinions or timeless facts.
         temperature=0,
     )
 
-    return json.loads(
-        response.choices[0].message.content
-    )
+    content = response.choices[0].message.content
+    result = _parse_json(content)
+
+    claims = result.get("claims", [])
+
+    if not isinstance(claims, list):
+        return {"claims": []}
+
+    return {"claims": claims}
 
 
-def verify_claims(claims, evidence):
+def verify_claims(claims: list, evidence: list) -> dict:
+    """
+    Compare extracted claims against current web evidence.
+    """
+    current_date = datetime.now(timezone.utc).date().isoformat()
+
     response = chat(
         messages=[
             {
@@ -103,10 +163,10 @@ Return JSON only:
 }
 
 Allowed statuses:
-supported
-stale
-contradicted
-insufficient_evidence
+- supported
+- stale
+- contradicted
+- insufficient_evidence
 
 Rules:
 - Do not treat missing evidence as contradiction.
@@ -115,25 +175,33 @@ Rules:
 - Distinguish old but historically correct facts
   from claims presented as current.
 - Use insufficient_evidence when unsure.
+- Do not wrap the JSON in Markdown fences.
 """,
             },
             {
                 "role": "user",
-                "content": json.dumps({
-                    "claims": claims,
-                    "evidence": evidence,
-                    "current_date": datetime.now(
-                        timezone.utc
-                    ).date().isoformat(),
-                }),
+                "content": json.dumps(
+                    {
+                        "claims": claims,
+                        "evidence": evidence,
+                        "current_date": current_date,
+                    },
+                    ensure_ascii=False,
+                ),
             },
         ],
         temperature=0,
     )
 
-    return json.loads(
-        response.choices[0].message.content
-    )
+    content = response.choices[0].message.content
+    result = _parse_json(content)
+
+    results = result.get("results", [])
+
+    if not isinstance(results, list):
+        return {"results": []}
+
+    return {"results": results}
 
 
 def detect_stale_answer(
@@ -146,11 +214,19 @@ def detect_stale_answer(
     Run freshness verification with trace spans.
 
     If trace is None, create a standalone trace.
+    Returns:
+        time_sensitive: bool
+        stale: bool
+        score: float
+        results: list
+        evidence: list
     """
 
+    # Create a trace and parent span when called standalone.
     if trace is None:
         trace = Trace(query)
 
+    if parent_span is None:
         parent_span = trace.start_span(
             name="freshness.evaluate",
             kind="freshness",
@@ -171,30 +247,35 @@ def detect_stale_answer(
 
         classification = classify_freshness(query)
 
+        time_sensitive = classification.get(
+            "time_sensitive",
+            False,
+        )
+
         classify_span.set_attributes(
             **{
-                "freshness.time_sensitive": (
-                    classification.get(
-                        "time_sensitive",
-                        False,
-                    )
+                "freshness.time_sensitive": time_sensitive,
+                "freshness.reason": classification.get(
+                    "reason",
+                    "",
                 ),
             }
         )
 
-    if not classification.get("time_sensitive"):
-
+    if not time_sensitive:
         result = {
             "time_sensitive": False,
             "stale": False,
-            "score": 0,
+            "score": 0.0,
             "results": [],
+            "evidence": [],
+            "evaluation_status": "not_time_sensitive",
         }
 
         parent_span.set_attributes(
             **{
                 "freshness.stale": False,
-                "freshness.score": 0,
+                "freshness.score": 0.0,
             }
         )
 
@@ -214,7 +295,6 @@ def detect_stale_answer(
     ) as extraction_span:
 
         extracted = extract_claims(answer)
-
         claims = extracted.get("claims", [])
 
         extraction_span.set_attributes(
@@ -224,31 +304,31 @@ def detect_stale_answer(
         )
 
     if not claims:
-
         result = {
             "time_sensitive": True,
             "stale": False,
-            "score": 0,
+            "score": 0.0,
             "results": [],
+            "evidence": [],
+            "evaluation_status": "no_time_sensitive_claims",
         }
 
         parent_span.set_attributes(
             **{
                 "freshness.stale": False,
-                "freshness.score": 0,
+                "freshness.score": 0.0,
             }
         )
 
         return result
 
     # ------------------------------------------
-    # 3. Retrieve current evidence
+    # 3. Retrieve current evidence from Tavily
     # ------------------------------------------
 
     evidence = []
 
     for index, claim in enumerate(claims):
-
         search_query = claim.get("search_query")
 
         if not search_query:
@@ -266,17 +346,9 @@ def detect_stale_answer(
         ) as search_span:
 
             try:
+                search_result = search_web(search_query)
 
-                from tavily_client import search_web
-
-                search_result = search_web(
-                    search_query
-                )
-
-                results = search_result.get(
-                    "results",
-                    [],
-                )
+                results = search_result.get("results", [])
 
                 evidence.extend(results)
 
@@ -288,7 +360,6 @@ def detect_stale_answer(
                 )
 
             except Exception as exc:
-
                 search_span.set_attributes(
                     **{
                         "tool.status": "error",
@@ -311,34 +382,50 @@ def detect_stale_answer(
         },
     ) as verification_span:
 
-        verification = verify_claims(
-            claims=claims,
-            evidence=evidence,
-        )
+        if evidence:
+            verification = verify_claims(
+                claims=claims,
+                evidence=evidence,
+            )
 
-        results = verification.get(
-            "results",
-            [],
+            results = verification.get("results", [])
+        else:
+            # No evidence is not proof that the answer is current.
+            results = [
+                {
+                    "claim": claim.get("claim", ""),
+                    "status": "insufficient_evidence",
+                    "confidence": 0.0,
+                    "explanation": (
+                        "No current web evidence was retrieved "
+                        "to verify this claim."
+                    ),
+                }
+                for claim in claims
+            ]
+
+        verification_span.set_attributes(
+            **{
+                "freshness.verified_claims": len(results),
+            }
         )
 
     # ------------------------------------------
-    # 5. Individual claim spans
+    # 5. Individual claim verification spans
     # ------------------------------------------
 
     for index, item in enumerate(results):
-
         with trace.span(
             name="freshness.claim_verification",
             kind="evaluation",
             parent_span=verification_span,
             attributes={
                 "freshness.claim_index": index,
-                "freshness.claim": item.get("claim"),
-                "freshness.claim_status": (
-                    item.get("status")
-                ),
-                "freshness.confidence": (
-                    item.get("confidence")
+                "freshness.claim": item.get("claim", ""),
+                "freshness.claim_status": item.get("status", ""),
+                "freshness.confidence": item.get(
+                    "confidence",
+                    0.0,
                 ),
             },
         ):
@@ -349,20 +436,43 @@ def detect_stale_answer(
     # ------------------------------------------
 
     stale_results = [
-        item for item in results
+        item
+        for item in results
+        if item.get("status") in ("stale", "contradicted")
+    ]
+
+    insufficient_results = [
+        item
+        for item in results
+        if item.get("status") == "insufficient_evidence"
+    ]
+
+    # Only calculate the stale ratio from claims that were
+    # actually verified. Insufficient evidence is not stale evidence.
+    verified_results = [
+        item
+        for item in results
         if item.get("status") in (
+            "supported",
             "stale",
             "contradicted",
         )
     ]
 
     stale_score = (
-        len(stale_results) / len(results)
-        if results
-        else 0
+        len(stale_results) / len(verified_results)
+        if verified_results
+        else 0.0
     )
 
-    stale = stale_score >= 0.70
+    stale = stale_score >= STALE_THRESHOLD
+
+    if not evidence or not verified_results:
+        evaluation_status = "insufficient_evidence"
+    elif insufficient_results:
+        evaluation_status = "partially_verified"
+    else:
+        evaluation_status = "verified"
 
     result = {
         "time_sensitive": True,
@@ -370,91 +480,17 @@ def detect_stale_answer(
         "score": round(stale_score, 3),
         "results": results,
         "evidence": evidence,
+        "evaluation_status": evaluation_status,
     }
 
     parent_span.set_attributes(
         **{
             "freshness.stale": stale,
-            "freshness.score": round(
-                stale_score,
-                3,
-            ),
-            "freshness.verified_claims": len(results),
-            "freshness.stale_claims": len(
-                stale_results
-            ),
+            "freshness.score": round(stale_score, 3),
+            "freshness.verified_claims": len(verified_results),
+            "freshness.stale_claims": len(stale_results),
+            "freshness.evaluation_status": evaluation_status,
         }
     )
 
     return result
-
-    classification = classify_freshness(query)
-
-    if not classification.get("time_sensitive"):
-        return {
-            "time_sensitive": False,
-            "stale": False,
-            "score": 0,
-            "results": [],
-        }
-
-    extracted = extract_claims(answer)
-
-    claims = extracted.get("claims", [])
-
-    if not claims:
-        return {
-            "time_sensitive": True,
-            "stale": False,
-            "score": 0,
-            "results": [],
-        }
-
-    evidence = []
-
-    for item in claims:
-        search_query = item.get("search_query")
-
-        if not search_query:
-            continue
-
-        result = search_web(search_query)
-
-        evidence.extend(
-            result.get("results", [])
-        )
-
-    verification = verify_claims(
-        claims=claims,
-        evidence=evidence,
-    )
-
-    results = verification.get("results", [])
-
-    if not results:
-        return {
-            "time_sensitive": True,
-            "stale": False,
-            "score": 0,
-            "results": [],
-        }
-
-    stale_results = [
-        item for item in results
-        if item.get("status") in (
-            "stale",
-            "contradicted",
-        )
-    ]
-
-    stale_score = (
-        len(stale_results) / len(results)
-    )
-
-    return {
-        "time_sensitive": True,
-        "stale": stale_score >= STALE_THRESHOLD,
-        "score": round(stale_score, 3),
-        "results": results,
-        "evidence": evidence,
-    }

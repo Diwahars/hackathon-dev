@@ -18,12 +18,21 @@ MODEL = os.getenv(
 )
 
 
-def chat(messages, tools=None, temperature=0.2):
+def chat_text(messages, temperature=0.2):
+    """Send a chat completion request to the Bifrost API.
+
+    Args:
+        messages: List of message objects for the conversation.
+        tools: Optional list of tool definitions for function calling.
+        temperature: Sampling temperature for response generation (default: 0.2).
+
+    Returns:
+        The chat completion response from the API.
+    """
     response = client.chat.completions.create(
         model=MODEL,
         messages=messages,
-        tools=tools,
         temperature=temperature,
     )
 
-    return response
+    return (response.choices[0].message.content or "").strip()

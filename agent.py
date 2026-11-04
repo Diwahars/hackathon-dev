@@ -1,329 +1,92 @@
+import os
+from observability.trace import Trace
+from agents import research_agent, freshness_agent, evidence_agent
+from agents import verification_agent, refresh_agent
 
-# agent.py
+def _safe_unverified_answer(reason):
+    return ("I couldn't verify a sufficiently current answer from the web evidence "
+            f"retrieved for this question. {reason} Please try again or provide a trusted, recent source.")
 
-import json
+def run_agent(query):
+    trace = Trace()
+    was_refreshed = False
+    evidence = {"query": "", "results": []}
+    verification = None
+    freshness = {}
 
-from bifrost_client import chat, MODEL
-from tavily_client import search_web
-from freshness import detect_stale_answer
-from observability import Trace
+    with trace.span("freshness_agent", {"query": query}) as span:
+        freshness = freshness_agent.run(query)
+        span.set_output(freshness)
+        print(f"Freshness: {freshness}")
+    # Search first for time-sensitive questions; the initial model response is
+    # only a baseline and is never treated as current evidence.
+    with trace.span("research_agent", {"query": query}) as span:
+        original_answer = research_agent.run(query)
+        span.set_output({"answer": original_answer})
+    print(f"Original answer: {original_answer}")
+    original_freshness = freshness.copy()
+    final_answer = original_answer
 
+    if freshness.get("time_sensitive"):
+        search_query = freshness.get("search_query") or query
+        # Ask Tavily for recent results. Its supported time_range values are
+        # coarse; the strict age policy is checked separately below.
+        time_range = os.getenv("TAVILY_TIME_RANGE", "month")
+        with trace.span("evidence_search_agent", {"query": search_query, "time_range": time_range}) as span:
+            evidence = evidence_agent.run(search_query, time_range=time_range)
+            span.set_output(evidence)
+        print(f"Evidence: {evidence}")
+        date_check = verification_agent.evidence_freshness(evidence)
+        with trace.span("evidence_freshness_gate", {"max_age_days": date_check["max_age_days"]}) as span:
+            span.set_output(date_check)
+        print(f"Date check: {date_check}")
+        with trace.span("claim_verification_agent", {"answer": original_answer}) as span:
+            verification = verification_agent.run(original_answer, evidence)
+            span.set_output(verification)
+        print(f"Verification: {verification}")
 
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "search_web",
-            "description": (
-                "Search current web information using Tavily. "
-                "Use for latest releases, changing facts, "
-                "current prices, and recent events."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                    }
-                },
-                "required": ["query"],
-                "additionalProperties": False,
-            },
-        },
+        # Force refresh for non-supported answers OR evidence that is stale /
+        # has unknown dates. Never silently pass stale evidence as current.
+        must_refresh = (verification.get("overall_status") != "supported"
+                        or date_check.get("status") != "fresh")
+        print(f"Must refresh: {must_refresh}")
+        if must_refresh:
+            was_refreshed = True
+            with trace.span("refresh_agent", {"query": query}) as span:
+                refreshed_answer = refresh_agent.run(query, original_answer, evidence, verification)
+                span.set_output({"answer": refreshed_answer})
+            print(f"Refreshed answer: {refreshed_answer}")
+            with trace.span("re_verification_agent", {"answer": refreshed_answer}) as span:
+                refreshed_verification = verification_agent.run(refreshed_answer, evidence)
+                span.set_output(refreshed_verification)
+            print(f"Refreshed verification: {refreshed_verification}")
+
+            # The refreshed answer is only accepted if evidence passes the age
+            # gate and the verifier supports it. Otherwise return an honest limit.
+            if (date_check.get("status") == "fresh"
+                    and refreshed_verification.get("overall_status") == "supported"):
+                final_answer = refreshed_answer
+                verification = refreshed_verification
+            else:
+                reason = date_check.get("reason", "Freshness could not be established.")
+                if refreshed_verification.get("overall_status") != "supported":
+                    reason += " The refreshed claims also did not pass evidence verification."
+                final_answer = _safe_unverified_answer(reason)
+                verification = refreshed_verification
+        elif date_check.get("status") == "fresh":
+            final_answer = original_answer
+        else:
+            final_answer = _safe_unverified_answer(date_check.get("reason", "Freshness is unknown."))
+
+    final_freshness = {
+        **freshness,
+        "evidence_freshness": date_check if freshness.get("time_sensitive") else None,
+        "verification_status": verification.get("overall_status") if verification else "not_checked",
+        "confidence": verification.get("confidence") if verification else None,
     }
-]
-
-
-TOOL_MAP = {
-    "search_web": search_web,
-}
-
-
-def run_agent(user_query: str):
-
-    trace = Trace(user_query)
-
-    root = trace.start_span(
-        name="agent.run",
-        kind="agent",
-        attributes={
-            "agent.name": "research-agent",
-            "agent.max_iterations": 6,
-        },
-    )
-
-    messages = [
-        {
-            "role": "system",
-            "content": """
-You are an AI research agent.
-
-Use search_web for current or changing information.
-Use tools when useful.
-Never invent tool results.
-Give a concise, evidence-based answer.
-Do not expose private chain-of-thought.
-""",
-        },
-        {
-            "role": "user",
-            "content": user_query,
-        },
-    ]
-
-    try:
-
-        for step in range(6):
-
-            # --------------------------------------
-            # Bifrost LLM span
-            # --------------------------------------
-
-            with trace.span(
-                name="bifrost.chat_completion",
-                kind="llm",
-                parent_span=root,
-                attributes={
-                    "llm.provider": "bifrost",
-                    "llm.model": MODEL,
-                    "agent.step": step,
-                },
-            ) as llm_span:
-
-                response = chat(
-                    messages=messages,
-                    tools=TOOLS,
-                )
-
-                message = response.choices[0].message
-
-                usage = response.usage
-
-                llm_span.set_attributes(
-                    **{
-                        "llm.response_model": response.model,
-                        "llm.prompt_tokens": (
-                            usage.prompt_tokens
-                            if usage else 0
-                        ),
-                        "llm.completion_tokens": (
-                            usage.completion_tokens
-                            if usage else 0
-                        ),
-                        "llm.finish_reason": (
-                            response.choices[0].finish_reason
-                        ),
-                    }
-                )
-
-            # --------------------------------------
-            # Agent decision span
-            # --------------------------------------
-
-            with trace.span(
-                name="agent.tool_selection",
-                kind="agent",
-                parent_span=root,
-                attributes={
-                    "agent.step": step,
-                },
-            ) as decision_span:
-
-                if message.tool_calls:
-
-                    selected_tools = [
-                        call.function.name
-                        for call in message.tool_calls
-                    ]
-
-                    decision_span.set_attributes(
-                        **{
-                            "decision.action": "execute_tool",
-                            "decision.selected_tools": (
-                                selected_tools
-                            ),
-                            "decision.reason": (
-                                "The model requested "
-                                "one or more tools."
-                            ),
-                        }
-                    )
-
-                else:
-
-                    decision_span.set_attributes(
-                        **{
-                            "decision.action": "final_answer",
-                            "decision.reason": (
-                                "The model returned a "
-                                "final response without "
-                                "requesting tools."
-                            ),
-                        }
-                    )
-
-            # --------------------------------------
-            # Final answer and freshness detection
-            # --------------------------------------
-
-            if not message.tool_calls:
-
-                answer = message.content or ""
-
-                with trace.span(
-                    name="agent.final_answer",
-                    kind="agent",
-                    parent_span=root,
-                    attributes={
-                        "answer.length": len(answer),
-                    },
-                ) as answer_span:
-
-                    answer_span.event(
-                        "answer_generated",
-                    )
-
-                with trace.span(
-                    name="freshness.evaluate",
-                    kind="freshness",
-                    parent_span=root,
-                    attributes={
-                        "freshness.query": user_query,
-                    },
-                ) as freshness_span:
-
-                    freshness = detect_stale_answer(
-                        query=user_query,
-                        answer=answer,
-                        trace=trace,
-                        parent_span=freshness_span,
-                    )
-
-                    freshness_span.set_attributes(
-                        **{
-                            "freshness.stale": (
-                                freshness.get("stale", False)
-                            ),
-                            "freshness.score": (
-                                freshness.get("score", 0)
-                            ),
-                            "freshness.time_sensitive": (
-                                freshness.get(
-                                    "time_sensitive",
-                                    False,
-                                )
-                            ),
-                        }
-                    )
-
-                root.end(
-                    status="success",
-                    **{
-                        "agent.status": "completed",
-                    },
-                )
-
-                trace.finish(answer)
-
-                return {
-                    "trace_id": trace.trace_id,
-                    "answer": answer,
-                    "freshness": freshness,
-                    "trace": trace.to_dict(),
-                }
-
-            # --------------------------------------
-            # Tool execution
-            # --------------------------------------
-
-            messages.append(
-                message.model_dump(
-                    exclude_none=True,
-                )
-            )
-
-            for tool_call in message.tool_calls:
-
-                tool_name = tool_call.function.name
-
-                arguments = json.loads(
-                    tool_call.function.arguments
-                )
-
-                tool_span = trace.start_span(
-                    name=f"tool.{tool_name}",
-                    kind="tool",
-                    parent_span=root,
-                    attributes={
-                        "tool.name": tool_name,
-                        "tool.call_id": tool_call.id,
-                        "tool.arguments": arguments,
-                    },
-                )
-
-                try:
-
-                    tool_function = TOOL_MAP.get(
-                        tool_name
-                    )
-
-                    if tool_function is None:
-                        raise ValueError(
-                            f"Unknown tool: {tool_name}"
-                        )
-
-                    result = tool_function(
-                        **arguments
-                    )
-
-                    tool_span.end(
-                        status="success",
-                        **{
-                            "tool.result_count": (
-                                len(result.get("results", []))
-                                if isinstance(result, dict)
-                                else 0
-                            ),
-                        },
-                    )
-
-                except Exception as exc:
-
-                    result = {
-                        "error": str(exc),
-                    }
-
-                    tool_span.end(
-                        status="error",
-                        **{
-                            "error.message": str(exc),
-                        },
-                    )
-
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": json.dumps(result),
-                    }
-                )
-
-        raise RuntimeError(
-            "Agent reached maximum iterations"
-        )
-
-    except Exception as exc:
-
-        root.end(
-            status="error",
-            **{
-                "error.message": str(exc),
-            },
-        )
-
-        trace.finish(
-            answer="",
-            status="failed",
-        )
-
-        raise
+    return {
+        "trace_id": trace.trace_id, "answer": final_answer,
+        "original_answer": original_answer, "original_freshness": original_freshness,
+        "was_refreshed": was_refreshed, "freshness": final_freshness,
+        "verification": verification, "evidence": evidence, "trace": trace.to_dict(),
+    }

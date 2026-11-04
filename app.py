@@ -1,173 +1,92 @@
-import json
-import os
-import sqlite3
-
-import pandas as pd
 import streamlit as st
-
-from dotenv import load_dotenv
 from agent import run_agent
 
-load_dotenv()
+from observability.trace_store import init_db, list_runs, get_run
 
-DB_PATH = os.getenv(
-    "DATABASE_PATH",
-    "agent_traces.db",
-)
+init_db()
 
-st.set_page_config(
-    page_title="Agent Observability",
-    page_icon="🤖",
-    layout="wide",
-)
-
-st.title("AI Agent Observability")
-st.caption(
-    "Bifrost Gateway + Tavily Freshness Detection"
-)
-
-
-def load_traces():
-    if not os.path.exists(DB_PATH):
-        return pd.DataFrame()
-
-    with sqlite3.connect(DB_PATH) as conn:
-        return pd.read_sql_query(
-            """
-            SELECT
-                trace_id,
-                query,
-                answer,
-                status,
-                started_at,
-                duration_ms,
-                events
-            FROM traces
-            ORDER BY started_at DESC
-            """,
-            conn,
-        )
-
+st.set_page_config(page_title="Multi-Agent Freshness Research", page_icon="🤖", layout="wide")
+st.title("Multi-Agent Research Agent")
+st.caption("Research | Freshness classification | Evidence verification | Refresh | Trace")
 
 query = st.text_area(
     "Ask the agent",
-    placeholder=(
-        "What is the latest version of Python?"
-    ),
+    placeholder="What is the latest version of Go (Golang)?",
+    height=100,
 )
 
 if st.button("Run Agent", type="primary"):
     if not query.strip():
         st.warning("Enter a query first.")
-
     else:
-        with st.spinner("Executing agent..."):
+        with st.spinner("Running agents and checking freshness..."):
             try:
-                result = run_agent(query)
-
-                st.session_state["result"] = result
-
+                st.session_state["result"] = run_agent(query.strip())
             except Exception as exc:
-                st.error(str(exc))
+                st.error(f"Agent execution failed: {exc}")
 
-
-result = st.session_state.get("result")
-
-if result:
+if "result" in st.session_state:
+    result = st.session_state["result"]
+    print(result)
+    st.divider()
     st.subheader("Final Answer")
-
-    st.write(result["answer"])
-
-    freshness = result.get("freshness", {})
-
-    col1, col2, col3 = st.columns(3)
-
-    col1.metric(
-        "Freshness",
-        "Stale" if freshness.get("stale") else "Fresh",
+    st.markdown(result.get("answer", "No answer returned."))
+    fresh = result.get("freshness") or {}
+    st.caption(
+        f"Trace ID: {result.get('trace_id')} | "
+        f"Time-sensitive: {fresh.get('time_sensitive')} | "
+        f"Verification: {fresh.get('verification_status')}"
     )
 
-    col2.metric(
-        "Stale Score",
-        freshness.get("score", 0),
-    )
+    if result.get("was_refreshed"):
+        st.subheader("Original vs Refreshed Answer")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("#### Original")
+            st.warning("Before evidence-based refresh")
+            st.markdown(result.get("original_answer", ""))
+            st.json(result.get("original_freshness", {}))
+        with col2:
+            st.markdown("#### Refreshed")
+            st.success("Regenerated using retrieved evidence")
+            st.markdown(result.get("answer", ""))
+            st.json(result.get("verification") or {})
+    else:
+        st.info("No refresh was required.")
+        with st.expander("Original answer"):
+            st.markdown(result.get("original_answer", ""))
 
-    col3.metric(
-        "Trace ID",
-        result["trace_id"][:8],
-    )
+    with st.expander("Evidence sources"):
+        st.json(result.get("evidence", {}))
 
-    st.subheader("Tool Execution Timeline")
-
-    events = result["trace"]["events"]
-
-    tool_events = [
-        event for event in events
-        if event["event_type"] == "tool_completed"
-    ]
-
-    if tool_events:
-        df = pd.DataFrame(tool_events)
-
-        st.dataframe(
-            df[
-                [
-                    "tool_name",
-                    "status",
-                    "duration_ms",
-                ]
-            ],
-            use_container_width=True,
-        )
-
-        st.bar_chart(
-            df.set_index("tool_name")[
-                "duration_ms"
-            ]
-        )
-
-    st.subheader("Freshness Verification")
-
-    for item in freshness.get("results", []):
-        with st.expander(
-            item.get("claim", "Claim")
-        ):
-            st.write(
-                "Status:",
-                item.get("status"),
-            )
-
-            st.write(
-                "Confidence:",
-                item.get("confidence"),
-            )
-
-            st.write(
-                "Explanation:",
-                item.get("explanation"),
-            )
-
-    with st.expander("Raw Trace Events"):
-        st.json(events)
-
-
-st.divider()
-
-st.subheader("Historical Agent Traces")
-
-history = load_traces()
-
-if not history.empty:
-    st.dataframe(
-        history[
-            [
-                "trace_id",
-                "query",
-                "status",
-                "duration_ms",
-            ]
-        ],
-        use_container_width=True,
-    )
-else:
-    st.info("No traces available yet.")
+    with st.expander("Agent execution trace"):
+        for item in (result.get("trace") or {}).get("spans", []):
+            label = (f"{item.get('agent_name')} | {item.get('status')} | "
+                     f"{item.get('duration_ms')} ms")
+            with st.expander(label):
+                st.write("Span ID:", item.get("span_id"))
+                st.write("Parent ID:", item.get("parent_id"))
+                st.write("Started:", item.get("started_at"))
+                st.write("Input:")
+                st.json(item.get("input"))
+                st.write("Output:")
+                st.json(item.get("output"))
+                if item.get("error"):
+                    st.error(item["error"])
+    
+    st.divider()
+    st.subheader("Saved run history")
+    try:
+        history = list_runs(limit=30)
+        if history:
+            labels = [f"{row['created_at']} 路 {row['query'][:100]}" for row in history]
+            selected = st.selectbox("Previous runs", labels)
+            chosen = history[labels.index(selected)]
+            if st.button("Load selected run"):
+                st.session_state["history_run"] = get_run(chosen["trace_id"])
+            if st.session_state.get("history_run"):
+                st.json(st.session_state["history_run"])
+        else:
+            st.caption("No saved runs yet.")
+    except Exception as exc:
+        st.warning(f"Could not load saved history: {exc}")
