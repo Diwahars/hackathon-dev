@@ -17,3 +17,5 @@ __pycache__/
 modules/1_embeddings/embeddings_similarity_analysis.png
 tavily-test.py
 bifrost.py
+freshness.py
+observability.py
