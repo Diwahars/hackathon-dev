@@ -102,7 +102,7 @@ if "result" in st.session_state:
     with st.expander("Agent execution trace"):
         for item in (result.get("trace") or {}).get("spans", []):
             label = (
-                f"{item.get('agent_name')} 路 {item.get('status')} 路 "
+                f"{item.get('agent_name')} | {item.get('status')} | "
                 f"{item.get('duration_ms')} ms"
             )
             with st.expander(label):
@@ -130,5 +130,5 @@ try:
             st.json(st.session_state["history_run"])
     else:
         st.caption("No saved runs yet.")
-except Exception as exc:
-    st.warning(f"Could not load saved history: {exc}")
+except Exception:
+    st.warning("Could not load saved history.")
