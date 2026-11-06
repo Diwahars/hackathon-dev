@@ -3,16 +3,30 @@ import os
 from bifrost_client import chat_text
 from agents.json_utils import parse_json
 
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+
+
 def _parse_date(value):
     if not value:
         return None
+
     try:
-        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
+        # First try ISO format
+        dt = datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        )
     except (ValueError, TypeError):
-        return None
+        try:
+            # Fallback: RFC 2822 format
+            dt = parsedate_to_datetime(str(value))
+        except (ValueError, TypeError, OverflowError):
+            return None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+
+    return dt.astimezone(timezone.utc)
 
 def get_evidence_date(item):
     """Extract a date from common metadata fields."""
@@ -48,7 +62,8 @@ def evidence_freshness(evidence, max_age_days=None):
         return {"status": "insufficient_evidence", "dated_sources": 0, "stale_sources": 0,
                 "max_age_days": max_age_days, "reason": "No web results were retrieved."}
     for item in results:
-        dt = _parse_date(item.get("date"))
+        print(f"Item--->: {item}")
+        dt = _parse_date(item.get("published_date"))
         if dt is None:
             continue
         dated += 1
