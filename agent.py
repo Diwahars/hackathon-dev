@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 import os
+import re
 
 from observability.trace import Trace
 from agents import (
@@ -12,6 +13,20 @@ from agents import (
     refresh_agent,
     hallucination_agent,
 )
+
+_STATIC_VERIFICATION_PATTERNS = (
+    re.compile(r"https?://\S+", re.IGNORECASE),
+    re.compile(r"\b(?:according to|cited in|source:|study by)\b", re.IGNORECASE),
+    re.compile(r"\b(?:19\d{2}|20\d{2})\b"),
+    re.compile(r"\b\d+(?:\.\d+)?%\b|\$\d+"),
+)
+
+
+def _needs_static_verification(answer: str | None) -> bool:
+    """Return True if a static answer contains URLs, citations, or specific figures."""
+    if not answer:
+        return False
+    return any(pattern.search(answer) for pattern in _STATIC_VERIFICATION_PATTERNS)
 
 
 def _safe_unverified_answer(reason: str) -> str:
@@ -59,7 +74,7 @@ def _retrieve_evidence(search_query: str, time_range: str | None, trace: Trace) 
                 "error": str(exc),
             }
         span.set_output(evidence)
-    return evidence
+        return evidence
 
 
 def _verify_answer(answer: str, evidence: dict, trace: Trace, span_name: str) -> dict:
@@ -74,7 +89,7 @@ def _verify_answer(answer: str, evidence: dict, trace: Trace, span_name: str) ->
         else:
             result = verification_agent.run(answer, evidence)
         span.set_output(result)
-    return result
+        return result
 
 
 def _detect_hallucinations(
@@ -100,29 +115,18 @@ def _detect_hallucinations(
                 "evaluator": "llm_judge_via_oss_bifrost",
             }
         span.set_output(result)
-    return result
+        return result
 
 
 def _hallucination_is_clear(result: dict | None) -> bool:
-    """Return True when the judge did not find a material falsehood.
-
-    `unsupported_claims` is not the same as `likely_hallucination`. The
-    independent claim-verification agent remains responsible for deciding
-    whether the answer is sufficiently supported. The hallucination judge
-    acts as a veto for contradicted/fabricated claims, not as a duplicate
-    all-claims-must-be-supported gate.
-    """
+    """Return True when the judge did not find a material falsehood."""
     return bool(result) and result.get("status") in {
         "grounded", "unsupported_claims"
     } and result.get("hallucination_detected") is False
 
 
 def run_agent(query: str) -> dict:
-    """Run baseline + retrieval concurrently, then evaluate both candidates.
-
-    OSS Bifrost is used as the LLM gateway. Hallucination evaluation is an
-    application-level LLM-as-judge agent, not a licensed Bifrost guardrail.
-    """
+    """Run baseline + retrieval concurrently, then evaluate both candidates."""
     query = (query or "").strip()
     if not query:
         raise ValueError("Query cannot be empty.")
@@ -148,10 +152,120 @@ def run_agent(query: str) -> dict:
         span.set_output(freshness)
     original_freshness = dict(freshness)
 
-    # Stable/general questions use one LLM response. Without evidence, a
-    # factual hallucination verdict is intentionally marked unverifiable.
+    # Stable/general questions use one LLM response by default, unless the
+    # answer includes verifiable specifics (URLs, citations, dates, figures).
     if not freshness.get("time_sensitive", False):
         original_answer = _run_static_query(query, trace)
+
+        if _needs_static_verification(original_answer):
+            evidence = _retrieve_evidence(query, None, trace)
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                ver_fut = executor.submit(
+                    _verify_answer,
+                    original_answer,
+                    evidence,
+                    trace,
+                    "original_verification_agent",
+                )
+                hal_fut = executor.submit(
+                    _detect_hallucinations,
+                    query,
+                    original_answer,
+                    evidence,
+                    trace,
+                    "original_hallucination_evaluation",
+                )
+                original_verification = ver_fut.result()
+                original_hallucination = hal_fut.result()
+
+            verification = original_verification
+            final_answer = original_answer
+
+            if not _hallucination_is_clear(original_hallucination):
+                refresh_attempted = True
+                claims = original_verification.get("claims", [])
+                with trace.span(
+                    "refresh_agent",
+                    {
+                        "query": query,
+                        "claims_count": len(claims),
+                        "original_status": original_verification.get("overall_status"),
+                    },
+                ) as span:
+                    try:
+                        refreshed_answer = refresh_agent.run(
+                            query=query, claims=claims, evidence=evidence
+                        )
+                        span.set_output({"answer": refreshed_answer})
+                    except Exception as exc:
+                        refreshed_answer_error = str(exc)
+                        span.set_output({"error": refreshed_answer_error})
+
+                if refreshed_answer:
+                    with ThreadPoolExecutor(max_workers=2) as executor:
+                        r_ver_fut = executor.submit(
+                            _verify_answer,
+                            refreshed_answer,
+                            evidence,
+                            trace,
+                            "refreshed_verification_agent",
+                        )
+                        r_hal_fut = executor.submit(
+                            _detect_hallucinations,
+                            query,
+                            refreshed_answer,
+                            evidence,
+                            trace,
+                            "refreshed_hallucination_evaluation",
+                        )
+                        refreshed_verification = r_ver_fut.result()
+                        refreshed_hallucination = r_hal_fut.result()
+
+                    if (
+                        refreshed_verification.get("overall_status")
+                        in {"verified", "partially_verified"}
+                        and _hallucination_is_clear(refreshed_hallucination)
+                    ):
+                        final_answer = refreshed_answer
+                        verification = refreshed_verification
+                        was_refreshed = True
+                        final_answer_source = "refreshed"
+
+                if not was_refreshed:
+                    final_answer = _safe_unverified_answer(
+                        "Independent LLM hallucination check flagged contradicted or fabricated specifics in the static response."
+                    )
+                    final_answer_source = "fallback"
+            else:
+                final_answer_source = "original"
+
+            final_freshness = {
+                **freshness,
+                "evidence_freshness": evidence.get("freshness"),
+                "verification_status": verification.get("overall_status"),
+                "confidence": verification.get("confidence"),
+            }
+            return {
+                "trace_id": trace.trace_id,
+                "answer": final_answer,
+                "original_answer": original_answer,
+                "original_answer_error": None,
+                "refreshed_answer": refreshed_answer,
+                "refreshed_answer_error": refreshed_answer_error,
+                "original_freshness": original_freshness,
+                "freshness": final_freshness,
+                "original_verification": original_verification,
+                "refreshed_verification": refreshed_verification,
+                "verification": verification,
+                "original_hallucination": original_hallucination,
+                "refreshed_hallucination": refreshed_hallucination,
+                "was_refreshed": was_refreshed,
+                "refresh_attempted": refresh_attempted,
+                "final_answer_source": final_answer_source,
+                "evidence": evidence,
+                "trace": trace.to_dict(),
+            }
+
         original_hallucination = _detect_hallucinations(
             query, original_answer, evidence, trace, "original_hallucination_evaluation"
         )
@@ -182,112 +296,112 @@ def run_agent(query: str) -> dict:
             "trace": trace.to_dict(),
         }
 
-    search_query = freshness.get("search_query") or query
+    search_query = (
+        freshness.get("search_query")
+        if isinstance(freshness.get("search_query"), str)
+        and freshness.get("search_query").strip()
+        else query
+    )
     time_range = _search_time_range()
 
-    # The baseline LLM response and Tavily retrieval run independently.
-    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="freshness-branch") as pool:
-        baseline_future = pool.submit(_generate_baseline, query, trace)
-        evidence_future = pool.submit(_retrieve_evidence, search_query, time_range, trace)
-
-        try:
-            original_answer = (baseline_future.result() or "").strip()
-        except Exception as exc:
-            original_answer_error = str(exc)
-            original_answer = ""
-
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        baseline_future = executor.submit(_generate_baseline, query, trace)
+        evidence_future = executor.submit(
+            _retrieve_evidence, search_query, time_range, trace
+        )
+        original_answer = baseline_future.result()
         evidence = evidence_future.result()
 
-    with trace.span("evidence_freshness_gate", {"query": query}) as span:
-        date_check = verification_agent.evidence_freshness(evidence)
-        span.set_output(date_check)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        verification_future = executor.submit(
+            _verify_answer,
+            original_answer,
+            evidence,
+            trace,
+            "original_verification_agent",
+        )
+        hallucination_future = executor.submit(
+            _detect_hallucinations,
+            query,
+            original_answer,
+            evidence,
+            trace,
+            "original_hallucination_evaluation",
+        )
+        original_verification = verification_future.result()
+        original_hallucination = hallucination_future.result()
 
-    # Generate an evidence-grounded candidate on every dynamic query.
-    refresh_attempted = True
-    with trace.span(
-        "refresh_agent",
-        {
-            "query": query,
-            "mode": "tavily_grounded_answer",
-            "evidence_count": len(evidence.get("results", [])),
-        },
-    ) as span:
-        try:
-            refreshed_answer = (
-                refresh_agent.run(query, original_answer, evidence) or ""
-            ).strip()
-            span.set_output({"answer": refreshed_answer})
-        except Exception as exc:
-            refreshed_answer_error = str(exc)
-            refreshed_answer = ""
-            span.set_output({"error": str(exc), "answer": None})
+    claims = original_verification.get("claims", [])
+    overall_status = original_verification.get("overall_status")
+    verification = original_verification
+    final_answer = original_answer
+    final_answer_source = "original"
 
-    # Run claim verification and hallucination evaluation for both candidates.
-    original_verification = _verify_answer(
-        original_answer, evidence, trace, "original_answer_verification"
-    )
-    refreshed_verification = _verify_answer(
-        refreshed_answer, evidence, trace, "refreshed_answer_verification"
-    )
-    original_hallucination = _detect_hallucinations(
-        query, original_answer, evidence, trace, "original_hallucination_evaluation"
-    )
-    refreshed_hallucination = _detect_hallucinations(
-        query, refreshed_answer, evidence, trace, "refreshed_hallucination_evaluation"
-    )
+    if overall_status != "verified" and _hallucination_is_clear(original_hallucination):
+        refresh_attempted = True
+        with trace.span(
+            "refresh_agent",
+            {
+                "query": query,
+                "claims_count": len(claims),
+                "original_status": overall_status,
+            },
+        ) as span:
+            try:
+                refreshed_answer = refresh_agent.run(
+                    query=query, claims=claims, evidence=evidence
+                )
+                span.set_output({"answer": refreshed_answer})
+            except Exception as exc:
+                refreshed_answer_error = str(exc)
+                span.set_output({"error": refreshed_answer_error})
 
-    evidence_is_fresh = date_check.get("status") == "fresh"
-    original_is_supported = (
-        original_verification.get("overall_status") == "supported"
-        and _hallucination_is_clear(original_hallucination)
-    )
-    refreshed_is_supported = (
-        refreshed_verification.get("overall_status") == "supported"
-        and _hallucination_is_clear(refreshed_hallucination)
-    )
+        if refreshed_answer:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                ver_fut = executor.submit(
+                    _verify_answer,
+                    refreshed_answer,
+                    evidence,
+                    trace,
+                    "refreshed_verification_agent",
+                )
+                hal_fut = executor.submit(
+                    _detect_hallucinations,
+                    query,
+                    refreshed_answer,
+                    evidence,
+                    trace,
+                    "refreshed_hallucination_evaluation",
+                )
+                refreshed_verification = ver_fut.result()
+                refreshed_hallucination = hal_fut.result()
 
-    decision_checks = {
-        "evidence_is_fresh": evidence_is_fresh,
-        "original_claims_supported": original_verification.get("overall_status") == "supported",
-        "refreshed_claims_supported": refreshed_verification.get("overall_status") == "supported",
-        "original_hallucination_clear": _hallucination_is_clear(original_hallucination),
-        "refreshed_hallucination_clear": _hallucination_is_clear(refreshed_hallucination),
-        "original_hallucination_status": original_hallucination.get("status"),
-        "refreshed_hallucination_status": refreshed_hallucination.get("status"),
-        "original_verification_status": original_verification.get("overall_status"),
-        "refreshed_verification_status": refreshed_verification.get("overall_status"),
-    }
+            refreshed_status = refreshed_verification.get("overall_status")
+            if (
+                refreshed_status in {"verified", "partially_verified"}
+                and _hallucination_is_clear(refreshed_hallucination)
+            ):
+                final_answer = refreshed_answer
+                verification = refreshed_verification
+                was_refreshed = True
+                final_answer_source = "refreshed"
 
-    if evidence_is_fresh and refreshed_is_supported:
-        final_answer = refreshed_answer
-        verification = refreshed_verification
-        was_refreshed = True
-        final_answer_source = "refreshed"
-    elif evidence_is_fresh and original_is_supported:
-        final_answer = original_answer
-        verification = original_verification
-        final_answer_source = "original_fallback"
-    else:
-        reasons = []
-        if not evidence_is_fresh:
-            reasons.append(
-                date_check.get("reason") or "Evidence freshness is unverified."
+    if not was_refreshed and overall_status not in {"verified", "partially_verified"}:
+        if not _hallucination_is_clear(original_hallucination):
+            final_answer = _safe_unverified_answer(
+                "Independent LLM hallucination check flagged contradicted or unverified statements."
             )
-        if not refreshed_is_supported and not original_is_supported:
-            reasons.append(
-                "Neither answer passed both claim verification and hallucination evaluation."
+        else:
+            final_answer = _safe_unverified_answer(
+                f"Initial claims evaluation returned status '{overall_status}'."
             )
-        final_answer = _safe_unverified_answer(" ".join(reasons))
-        verification = refreshed_verification
-        final_answer_source = "unverified"
+        final_answer_source = "fallback"
 
     final_freshness = {
         **freshness,
-        "evidence_freshness": date_check,
-        "verification_status": (
-            verification.get("overall_status") if verification else "not_checked"
-        ),
-        "confidence": verification.get("confidence") if verification else None,
+        "evidence_freshness": evidence.get("freshness"),
+        "verification_status": verification.get("overall_status"),
+        "confidence": verification.get("confidence"),
     }
 
     return {
@@ -307,7 +421,6 @@ def run_agent(query: str) -> dict:
         "was_refreshed": was_refreshed,
         "refresh_attempted": refresh_attempted,
         "final_answer_source": final_answer_source,
-        "decision_checks": decision_checks,
         "evidence": evidence,
         "trace": trace.to_dict(),
     }
