@@ -68,9 +68,9 @@ flowchart TD
 - Sources without parseable publication dates are not counted as dated evidence.
 
 
-## Hallucination detection with OSS Bifrost (no licensed guardrails)
+## Hallucination detection with Bifrost
 
-The project implements hallucination detection as an **application-level LLM-as-judge agent** in `agents/hallucination_agent.py`. The judge uses the regular OpenAI-compatible chat-completions endpoint exposed by OSS Bifrost. It does not send `x-bf-guardrail-id`, call Enterprise guardrail APIs, or require Patronus credentials/a license.
+The project implements hallucination detection as an **application-level LLM-as-judge agent** in `agents/hallucination_agent.py`. The judge uses the regular OpenAI-compatible chat-completions endpoint exposed by Bifrost. It does not send `x-bf-guardrail-id`, call Enterprise guardrail APIs, or require Patronus credentials/a license.
 
 For each time-sensitive query:
 
@@ -100,7 +100,7 @@ BIFROST_MODEL=openai/gpt-4o-mini
 TAVILY_API_KEY=your-tavily-key
 ```
 
-No Bifrost guardrail ID, Patronus profile, or licensed feature is required. The quality of the LLM-as-judge depends on the selected model and the quality/coverage of the supplied evidence. Treat the judge as an independent evaluation signal, not mathematical proof of truth.
+The quality of the LLM-as-judge depends on the selected model and the quality/coverage of the supplied evidence. Treat the judge as an independent evaluation signal, not mathematical proof of truth.
 
 ## Trace history
 
