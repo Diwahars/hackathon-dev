@@ -1,18 +1,10 @@
 """LLM answer generation for baseline and stable/general questions."""
 
 from bifrost_client import chat_text
-from agents.verification_agent import format_evidence
 
 
-def run_baseline(query: str) -> str:
-    """Generate the original answer from model knowledge, without web evidence.
-
-    This answer is intentionally a baseline for comparison. For time-sensitive
-    questions, it must be labelled as potentially outdated and must not imply
-    that a live lookup was performed.
-    """
-    query = (query or "").strip()
-    messages = [
+def _baseline_messages(query: str):
+    return [
         {
             "role": "system",
             "content": """You are a knowledgeable research assistant producing an ORIGINAL BASELINE answer.
@@ -30,15 +22,16 @@ Do not include fabricated URLs or citations. Do not expose private chain-of-thou
         },
         {"role": "user", "content": query},
     ]
-    return chat_text(messages, temperature=0.2)
+
+
+def run_baseline(query: str) -> str:
+    """Generate an LLM-only baseline answer through OSS Bifrost."""
+    query = (query or "").strip()
+    return chat_text(_baseline_messages(query), temperature=0.2)
 
 
 def run(query: str, evidence: dict | None = None) -> str:
-    """Answer stable/general questions, or evidence-grounded questions.
-
-    ``evidence=None`` is the stable/general path. Time-sensitive baseline
-    generation should use :func:`run_baseline` so it is explicitly labelled.
-    """
+    """Answer stable/general questions, or evidence-grounded questions."""
     query = (query or "").strip()
     results = (evidence or {}).get("results", [])
 
@@ -57,6 +50,7 @@ def run(query: str, evidence: dict | None = None) -> str:
         )
         user_prompt = query
     else:
+        from agents.verification_agent import format_evidence
         system_prompt = """You are an evidence-grounded research agent.
 Use ONLY the supplied web evidence for current or changing facts.
 Do not invent prices, versions, dates, statistics, statuses or citations.

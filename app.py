@@ -7,10 +7,10 @@ init_db()
 
 st.set_page_config(
     page_title="Multi-Agent Freshness Research",
-    page_icon="🤖",
+    page_icon="🔍",
     layout="wide",
 )
-st.title("🤖 Multi-Agent Research Agent")
+st.title("🔍 Multi-Agent Research Agent")
 st.caption(
     "Parallel LLM baseline | Tavily retrieval | Evidence-grounded refresh | "
     "Independent verification"
@@ -57,6 +57,8 @@ if "result" in st.session_state:
             st.markdown(original)
         else:
             st.warning("The original LLM answer could not be generated.")
+            if result.get("original_answer_error"):
+                st.code(result["original_answer_error"])
 
         with st.expander("Original answer verification"):
             st.json(result.get("original_verification") or {})
@@ -69,6 +71,8 @@ if "result" in st.session_state:
             st.markdown(refreshed)
         else:
             st.warning("The refresh agent did not generate an answer.")
+            if result.get("refreshed_answer_error"):
+                st.code(result["refreshed_answer_error"])
 
         with st.expander("Refreshed answer verification"):
             st.json(result.get("refreshed_verification") or {})
@@ -99,6 +103,25 @@ if "result" in st.session_state:
     with st.expander("Tavily evidence sources"):
         st.json(result.get("evidence", {}))
 
+    with st.expander("LLM-based hallucination evaluation (OSS Bifrost)"):
+        st.caption(
+            "This is an application-level LLM-as-judge evaluation sent through "
+            "the normal OSS Bifrost chat-completions API. It does not use "
+            "x-bf-guardrail-id, Enterprise guardrails, or a licensed provider."
+        )
+        hall_col1, hall_col2 = st.columns(2)
+        with hall_col1:
+            st.markdown("**Original answer**")
+            st.json(result.get("original_hallucination") or {})
+        with hall_col2:
+            st.markdown("**Refreshed answer**")
+            st.json(result.get("refreshed_hallucination") or {})
+        st.caption(
+            "The judge compares answer claims with retrieved evidence. If no "
+            "independent evidence is available, the result is 'unverifiable' "
+            "rather than a false hallucination-free pass."
+        )
+
     with st.expander("Agent execution trace"):
         for item in (result.get("trace") or {}).get("spans", []):
             label = (
@@ -121,7 +144,7 @@ st.subheader("Saved run history")
 try:
     history = list_runs(limit=30)
     if history:
-        labels = [f"{row['created_at']} 路 {row['query'][:100]}" for row in history]
+        labels = [f"{row['created_at']} | {row['query'][:100]}" for row in history]
         selected = st.selectbox("Previous runs", labels)
         chosen = history[labels.index(selected)]
         if st.button("Load selected run"):
@@ -130,5 +153,5 @@ try:
             st.json(st.session_state["history_run"])
     else:
         st.caption("No saved runs yet.")
-except Exception:
-    st.warning("Could not load saved history.")
+except Exception as exc:
+    st.warning(f"Could not load saved history: {exc}")

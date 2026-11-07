@@ -15,9 +15,10 @@ def init_db():
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     with connect() as conn:
         conn.execute("""CREATE TABLE IF NOT EXISTS runs (
-            trace_id TEXT PRIMARY KEY, query TEXT, original_answer TEXT, final_answer TEXT,
-            was_refreshed INTEGER, time_sensitive INTEGER, verification_status TEXT,
-            started_at TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+            trace_id TEXT PRIMARY KEY, query TEXT, original_answer TEXT, refreshed_answer TEXT,
+            final_answer TEXT, final_answer_source TEXT, was_refreshed INTEGER,
+            time_sensitive INTEGER, verification_status TEXT, started_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
         conn.execute("""CREATE TABLE IF NOT EXISTS spans (
             span_id TEXT PRIMARY KEY, trace_id TEXT, parent_id TEXT, agent_name TEXT,
             status TEXT, started_at TEXT, duration_ms REAL, input_json TEXT,
@@ -30,19 +31,37 @@ def init_db():
 
 def migrate_db():
     """Add missing columns to older local DBs without dropping saved trace history."""
-    required = {
+    span_columns = {
         "parent_id": "TEXT", "agent_name": "TEXT", "status": "TEXT",
         "started_at": "TEXT", "duration_ms": "REAL", "input_json": "TEXT",
         "output_json": "TEXT", "error": "TEXT",
     }
+    run_columns = {
+        "refreshed_answer": "TEXT",
+        "final_answer_source": "TEXT",
+    }
     with connect() as conn:
-        exists = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='spans'").fetchone()
-        if not exists:
-            return
-        current = {row["name"] for row in conn.execute("PRAGMA table_info(spans)")}
-        for name, column_type in required.items():
-            if name not in current:
-                conn.execute(f"ALTER TABLE spans ADD COLUMN {name} {column_type}")
+        spans_exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='spans'"
+        ).fetchone()
+        if spans_exists:
+            current_spans = {
+                row["name"] for row in conn.execute("PRAGMA table_info(spans)")
+            }
+            for name, column_type in span_columns.items():
+                if name not in current_spans:
+                    conn.execute(f"ALTER TABLE spans ADD COLUMN {name} {column_type}")
+
+        runs_exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='runs'"
+        ).fetchone()
+        if runs_exists:
+            current_runs = {
+                row["name"] for row in conn.execute("PRAGMA table_info(runs)")
+            }
+            for name, column_type in run_columns.items():
+                if name not in current_runs:
+                    conn.execute(f"ALTER TABLE runs ADD COLUMN {name} {column_type}")
 
 def save_run(result, query):
     init_db()
@@ -51,11 +70,15 @@ def save_run(result, query):
     verification = result.get("verification") or {}
     with connect() as conn:
         conn.execute("""INSERT OR REPLACE INTO runs
-            (trace_id, query, original_answer, final_answer, was_refreshed, time_sensitive,
-             verification_status, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (result.get("trace_id"), query, result.get("original_answer"), result.get("answer"),
-             int(bool(result.get("was_refreshed"))), int(bool(freshness.get("time_sensitive"))),
-             verification.get("overall_status", freshness.get("verification_status")), trace.get("started_at")))
+            (trace_id, query, original_answer, refreshed_answer, final_answer,
+             final_answer_source, was_refreshed, time_sensitive, verification_status,
+             started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (result.get("trace_id"), query, result.get("original_answer"),
+             result.get("refreshed_answer"), result.get("answer"),
+             result.get("final_answer_source"), int(bool(result.get("was_refreshed"))),
+             int(bool(freshness.get("time_sensitive"))),
+             verification.get("overall_status", freshness.get("verification_status")),
+             trace.get("started_at")))
         for span in trace.get("spans", []):
             conn.execute("""INSERT OR REPLACE INTO spans
                 (span_id, trace_id, parent_id, agent_name, status, started_at, duration_ms,
