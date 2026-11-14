@@ -11,7 +11,12 @@ __pycache__/
 *.swp
 *.swo
 *.joblib
-
+*.db
+*.db-.*
+*.pem
 *.log
 modules/1_embeddings/embeddings_similarity_analysis.png
-test.py
+tavily-test.py
+bifrost.py
+freshness.py
+observability.py
